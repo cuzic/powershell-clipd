@@ -1,0 +1,138 @@
+# clipd
+
+Windows クリップボードの内容を HTTP で返す軽量サービスと、Linux 側クライアント。  
+Tailscale tailnet 内での使用を前提とする。
+
+## 構成
+
+| ファイル | 役割 |
+|---|---|
+| `clipd.ps1` | Windows 側サーバ。クリップボードを HTTP で返す |
+| `clip` | Linux/Mac 側クライアント。`clipd` を叩いて内容を取得する |
+
+## 動作イメージ
+
+```
+Windows (clipd.ps1)          Linux / Mac (clip)
+┌──────────────────┐          ┌──────────────────────┐
+│  クリップボード   │  tailnet │  tssh / ssh でログイン│
+│  ↓ HTTP         │◀─────────│  $ clip               │
+│  clipd.ps1:9999  │          │  → 内容が標準出力に   │
+└──────────────────┘          └──────────────────────┘
+```
+
+## Windows 側: clipd.ps1
+
+### 起動方法
+
+```powershell
+# tailnet に出す + Bearer token 認証 (推奨)
+powershell -ExecutionPolicy Bypass -File clipd.ps1 -Token "好きな文字列"
+
+# tailnet に出す + token なし (明示的に許可)
+powershell -ExecutionPolicy Bypass -File clipd.ps1 -AllowNoToken
+
+# localhost だけで使う (同じ Windows 上の tmux 等)
+powershell -ExecutionPolicy Bypass -File clipd.ps1 -BindLocalhostOnly
+```
+
+環境変数でもトークンを渡せる:
+
+```powershell
+$env:CLIPD_TOKEN = "好きな文字列"
+powershell -ExecutionPolicy Bypass -File clipd.ps1
+```
+
+### パラメータ
+
+| パラメータ | 既定 | 説明 |
+|---|---|---|
+| `-Port` | `9999` | 待ち受けポート |
+| `-Token` | `$env:CLIPD_TOKEN` | Bearer トークン (未指定で認証なし) |
+| `-BindLocalhostOnly` | off | localhost のみバインド |
+| `-AllowNoToken` | off | token なし tailnet 公開を明示許可 |
+
+### セキュリティ
+
+- token なし & tailnet 公開はデフォルトで拒否される (`-AllowNoToken` で上書き可)
+- 多重起動防止に名前付き Mutex を使用
+- Tailscale IP は `tailscale ip -4` または CGNAT 帯 (`100.64.0.0/10`) で自動検出
+
+### Tailscale IP へのバインド権限
+
+初回起動時に `Failed to start HttpListener` が出る場合、管理者 PowerShell で:
+
+```powershell
+netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
+```
+
+### API
+
+| エンドポイント | 説明 |
+|---|---|
+| `GET /` | クリップボード自動判別 |
+| `GET /clip` | 同上 |
+| `GET /health` | 死活確認 (認証不要) |
+
+レスポンスヘッダ `X-Clip-Kind` に種別が入る:
+
+| 値 | Content-Type | 内容 |
+|---|---|---|
+| `image` | `image/png` | PNG バイナリ |
+| `files` | `application/json` | Windows パスの配列 |
+| `text` | `text/plain; charset=utf-8` | テキスト |
+| `empty` | `text/plain; charset=utf-8` | 空文字列 |
+
+## Linux 側: clip
+
+### インストール
+
+```bash
+curl -o ~/bin/clip https://raw.githubusercontent.com/<user>/powershell-clipd/main/clip
+chmod +x ~/bin/clip
+```
+
+### 設定
+
+```bash
+export CLIPD_HOST=my-windows   # Tailscale MagicDNS 名 or 100.x.y.z
+export CLIPD_PORT=9999         # 省略可 (既定 9999)
+export CLIPD_TOKEN=secret      # clipd を -Token 付きで起動した場合のみ
+```
+
+`.bashrc` / `.zshrc` に書いておくと便利。
+
+### 使い方
+
+```bash
+clip              # クリップボードの内容を自動判別して出力
+clip -q           # パスや本文だけ (Claude Code などに渡しやすい)
+clip -d ~/pics    # 画像の保存先を指定 (既定: ./cc-images)
+clip -h           # ヘルプ
+```
+
+### 出力例
+
+```bash
+# テキストの場合
+$ clip
+コピーしたテキストがここに出る
+
+# 画像の場合
+$ clip
+画像を保存しました: ./cc-images/clip_20240627_153000.png
+
+# ファイルリストの場合
+$ clip
+クリップボードのファイル (Windows 側パス):
+["C:\\Users\\user\\Desktop\\foo.txt","C:\\Users\\user\\Desktop\\bar.png"]
+本体転送は Windows 側で trz を使ってください。
+
+# quiet モード (スクリプトや Claude Code へのパイプ向け)
+$ clip -q
+./cc-images/clip_20240627_153000.png
+```
+
+## ライセンス
+
+MIT

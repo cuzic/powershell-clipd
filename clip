@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# clip - リモート側から Windows の clipd を叩いてクリップボード内容を取得する
+#
+# 使い方:
+#   clip          クリップボードの中身を自動判別して出す
+#   clip -d DIR   画像の保存先 (既定: ./cc-images)
+#   clip -q       パスや本文だけを出力 (Claude Code に渡しやすい)
+#
+# 事前設定:
+#   export CLIPD_HOST=my-windows     # Tailscale の MagicDNS 名 or 100.x.y.z
+#   export CLIPD_PORT=9999           # 任意 (既定 9999)
+#   export CLIPD_TOKEN=secret        # clipd を -Token 付きで起動した場合のみ
+#
+# 仕組み:
+#   同じ tailnet 上の Windows で動く clipd に GET /clip する。
+#   X-Clip-Kind ヘッダ (image|files|text|empty) で分岐する。
+
+set -euo pipefail
+
+CLIPD_HOST="${CLIPD_HOST:-}"
+CLIPD_PORT="${CLIPD_PORT:-9999}"
+CLIPD_TOKEN="${CLIPD_TOKEN:-}"
+SAVE_DIR="./cc-images"
+QUIET=0
+
+usage() {
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+while getopts "d:qh" opt; do
+    case "$opt" in
+        d) SAVE_DIR="$OPTARG" ;;
+        q) QUIET=1 ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+if [[ -z "$CLIPD_HOST" ]]; then
+    echo "error: CLIPD_HOST is not set. e.g. export CLIPD_HOST=my-windows" >&2
+    exit 1
+fi
+
+BASE="http://${CLIPD_HOST}:${CLIPD_PORT}"
+URL="$BASE/clip"
+
+CURL_ARGS=(-fsS -D - --max-time 10)
+if [[ -n "$CLIPD_TOKEN" ]]; then
+    CURL_ARGS+=(-H "Authorization: Bearer $CLIPD_TOKEN")
+fi
+
+TMP_BODY="$(mktemp)"
+trap 'rm -f "$TMP_BODY"' EXIT
+
+if ! HDRS="$(curl "${CURL_ARGS[@]}" -o "$TMP_BODY" "$URL" 2>/dev/null)"; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' "${CURL_ARGS[@]:1}" "$URL" 2>/dev/null || true)"
+    case "$code" in
+        401) echo "error: unauthorized (CLIPD_TOKEN を確認)" >&2 ;;
+        404) echo "error: not found ($URL)" >&2 ;;
+        000|"") echo "error: cannot reach clipd at $BASE (tailnet 接続と clipd 起動を確認)" >&2 ;;
+        *)   echo "error: clipd returned HTTP $code" >&2 ;;
+    esac
+    exit 1
+fi
+
+KIND="$(printf '%s' "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-clip-kind"{print $2}')"
+
+case "$KIND" in
+    image)
+        mkdir -p "$SAVE_DIR"
+        DEST="$SAVE_DIR/clip_$(date +%Y%m%d_%H%M%S).png"
+        cp "$TMP_BODY" "$DEST"
+        if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST"
+        else echo "画像を保存しました: $DEST"; fi
+        ;;
+    text)
+        cat "$TMP_BODY"
+        [[ "$QUIET" -eq 1 ]] || echo
+        ;;
+    files)
+        if [[ "$QUIET" -eq 1 ]]; then cat "$TMP_BODY"; echo
+        else
+            echo "クリップボードのファイル (Windows 側パス):"
+            cat "$TMP_BODY"; echo
+            echo "本体転送は Windows 側で trz を使ってください。"
+        fi
+        ;;
+    empty|"")
+        [[ "$QUIET" -eq 1 ]] || echo "クリップボードは空です。"
+        ;;
+    error)
+        echo "clipd error:" >&2; cat "$TMP_BODY" >&2; echo >&2; exit 1
+        ;;
+    *)
+        echo "unknown kind: $KIND" >&2; cat "$TMP_BODY"
+        ;;
+esac
