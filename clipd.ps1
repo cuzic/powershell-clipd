@@ -8,18 +8,26 @@
     現在の Windows クリップボードの内容を返す。
 
     クリップボードの種別を自動判別して返す:
-      - 画像        -> 200  image/png            (PNG バイナリ)
-      - ファイル一覧 -> 200  application/json      (パスの配列)
-      - テキスト    -> 200  text/plain; utf-8
-      - 空          -> 200  text/plain; utf-8     (空文字列)
+      - 画像 (ビットマップ)         -> 200  image/png
+      - 実ファイル (CF_HDROP)       -> 200  application/json  (Windows パスの配列)
+      - 仮想ファイル (Outlook 添付等)-> 200  application/json  (ファイル名の配列)
+      - 音声 (CF_WAVE)              -> 200  audio/wav
+      - HTML (HTML Format)          -> 200  text/html
+      - URL                         -> 200  text/plain
+      - RTF (Rich Text Format)      -> 200  text/rtf
+      - テキスト                    -> 200  text/plain
+      - 空                          -> 200  text/plain (空文字列)
 
-    種別はレスポンスヘッダ X-Clip-Kind (image|files|text|empty) でも返す。
+    種別はレスポンスヘッダ X-Clip-Kind で返す:
+      image | files | vfiles | audio | html | url | rtf | text | empty
 
-    ルーティング (使い分けは想定せず自動判別に一本化):
-      GET /        自動判別
-      GET /clip    自動判別 (/ と同じ)
-      GET /health  死活確認
-      それ以外     404
+    ルーティング:
+      GET /             自動判別
+      GET /clip         自動判別 (/ と同じ)
+      GET /file?path=   CF_HDROP ファイルの実体 (クリップボード照合あり)
+      GET /vfile?i=N    仮想ファイルの実体 (インデックス指定)
+      GET /health       死活確認
+      それ以外          404
 
 .PARAMETER Port
     待ち受けポート。既定 9999。
@@ -52,6 +60,126 @@ param(
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# ---- 仮想ファイル (Outlook 添付等) 取得ヘルパ ----------------------------------
+# CF_HDROP にパスが存在しない仮想ファイルを COM IDataObject 経由で取得する。
+# Add-Type はプロセス AppDomain に型をロードするため、STA ランスペースでも参照可能。
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Windows.Forms;
+
+public static class VirtualFileHelper {
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern ushort RegisterClipboardFormat(string name);
+    [DllImport("ole32.dll")]
+    private static extern void ReleaseStgMedium(ref STGMEDIUM p);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GlobalLock(IntPtr h);
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(IntPtr h);
+    [DllImport("kernel32.dll")]
+    private static extern UIntPtr GlobalSize(IntPtr h);
+
+    public static bool HasVirtualFiles() {
+        var d = Clipboard.GetDataObject();
+        return d != null
+            && (d.GetDataPresent("FileGroupDescriptorW") || d.GetDataPresent("FileGroupDescriptor"))
+            && d.GetDataPresent("FileContents");
+    }
+
+    public static string[] GetFileNames() {
+        var com = Clipboard.GetDataObject() as System.Runtime.InteropServices.ComTypes.IDataObject;
+        if (com == null) return null;
+        foreach (var fmt in new[] { "FileGroupDescriptorW", "FileGroupDescriptor" }) {
+            bool uni = fmt == "FileGroupDescriptorW";
+            var fe = new FORMATETC();
+            fe.cfFormat = (short)RegisterClipboardFormat(fmt);
+            fe.ptd      = IntPtr.Zero;
+            fe.dwAspect = DVASPECT.DVASPECT_CONTENT;
+            fe.lindex   = -1;
+            fe.tymed    = TYMED.TYMED_HGLOBAL;
+            var sm = new STGMEDIUM();
+            try {
+                com.GetData(ref fe, out sm);
+                if (sm.tymed == TYMED.TYMED_HGLOBAL) return ParseFGD(sm.unionmember, uni);
+            } catch { }
+            finally { ReleaseStgMedium(ref sm); }
+        }
+        return null;
+    }
+
+    public static byte[] GetFileContents(int index) {
+        var com = Clipboard.GetDataObject() as System.Runtime.InteropServices.ComTypes.IDataObject;
+        if (com == null) return null;
+        var fe = new FORMATETC();
+        fe.cfFormat = (short)RegisterClipboardFormat("FileContents");
+        fe.ptd      = IntPtr.Zero;
+        fe.dwAspect = DVASPECT.DVASPECT_CONTENT;
+        fe.lindex   = index;
+        fe.tymed    = TYMED.TYMED_ISTREAM | TYMED.TYMED_HGLOBAL;
+        var sm = new STGMEDIUM();
+        try {
+            com.GetData(ref fe, out sm);
+            if (sm.tymed == TYMED.TYMED_ISTREAM) {
+                var ist = (System.Runtime.InteropServices.ComTypes.IStream)
+                    Marshal.GetObjectForIUnknown(sm.unionmember);
+                return DrainIStream(ist);
+            }
+            if (sm.tymed == TYMED.TYMED_HGLOBAL) return ReadHGlobal(sm.unionmember);
+        } catch { }
+        finally { ReleaseStgMedium(ref sm); }
+        return null;
+    }
+
+    private static string[] ParseFGD(IntPtr hGlobal, bool unicode) {
+        // FILEDESCRIPTORW: 72 bytes metadata + MAX_PATH(260) WCHAR = 592 bytes/entry
+        // FILEDESCRIPTORA: 72 bytes metadata + MAX_PATH(260) CHAR  = 332 bytes/entry
+        IntPtr ptr = GlobalLock(hGlobal);
+        try {
+            int count    = Marshal.ReadInt32(ptr);
+            int entSize  = unicode ? 592 : 332;
+            int nameOff  = 72;
+            var names = new string[count];
+            for (int i = 0; i < count; i++) {
+                IntPtr p = IntPtr.Add(ptr, 4 + i * entSize + nameOff);
+                names[i] = unicode
+                    ? Marshal.PtrToStringUni(p, 260).TrimEnd('\0')
+                    : Marshal.PtrToStringAnsi(p, 260).TrimEnd('\0');
+            }
+            return names;
+        } finally { GlobalUnlock(hGlobal); }
+    }
+
+    private static byte[] DrainIStream(System.Runtime.InteropServices.ComTypes.IStream ist) {
+        var ms  = new MemoryStream();
+        var buf = new byte[65536];
+        var np  = Marshal.AllocHGlobal(IntPtr.Size);
+        try {
+            while (true) {
+                ist.Read(buf, buf.Length, np);
+                int n = IntPtr.Size == 8 ? (int)Marshal.ReadInt64(np) : Marshal.ReadInt32(np);
+                if (n <= 0) break;
+                ms.Write(buf, 0, n);
+            }
+        } finally { Marshal.FreeHGlobal(np); }
+        return ms.ToArray();
+    }
+
+    private static byte[] ReadHGlobal(IntPtr hGlobal) {
+        IntPtr ptr = GlobalLock(hGlobal);
+        try {
+            int size = (int)GlobalSize(hGlobal).ToUInt64();
+            var data = new byte[size];
+            Marshal.Copy(ptr, data, 0, size);
+            return data;
+        } finally { GlobalUnlock(hGlobal); }
+    }
+}
+'@ -ReferencedAssemblies 'System.Windows.Forms'
 
 $ErrorActionPreference = 'Stop'
 
@@ -144,7 +272,7 @@ Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
 
 # ---- STA で scriptblock を実行 (例外時も finally で確実に後始末) -------------
 function Invoke-InSTA {
-    param([scriptblock]$Script)
+    param([scriptblock]$Script, [object[]]$Arguments = @())
     $ps = $null
     $rs = $null
     try {
@@ -155,6 +283,7 @@ function Invoke-InSTA {
         $rs.Open()
         $ps.Runspace = $rs
         [void]$ps.AddScript($Script)
+        foreach ($a in $Arguments) { [void]$ps.AddArgument($a) }
         $result = $ps.Invoke()
         if ($ps.HadErrors) {
             $err = $ps.Streams.Error | Select-Object -First 1
@@ -168,14 +297,14 @@ function Invoke-InSTA {
     }
 }
 
-# ---- クリップボード読み取り (自動判別 + retry) ------------------------------
-# エンドポイントを自動判別に一本化したので、読み取りも1種類だけ。
+# ---- クリップボード読み取り (全種別対応 + retry) ------------------------------
 function Read-Clipboard {
     $script = {
         Add-Type -AssemblyName System.Windows.Forms
         Add-Type -AssemblyName System.Drawing
         for ($i = 0; $i -lt 5; $i++) {
             try {
+                # 1. 画像 (ビットマップ / スクリーンショット等)
                 if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
                     $img = [System.Windows.Forms.Clipboard]::GetImage()
                     $ms = New-Object System.IO.MemoryStream
@@ -187,18 +316,79 @@ function Read-Clipboard {
                         if ($ms)  { $ms.Dispose() }
                     }
                 }
+                # 2. 実ファイル (Explorer でコピーした既存ファイル)
                 elseif ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
                     $files = [System.Windows.Forms.Clipboard]::GetFileDropList()
                     $list = @()
                     foreach ($f in $files) { $list += $f }
                     return [pscustomobject]@{ Kind = 'files'; Files = $list }
                 }
-                elseif ([System.Windows.Forms.Clipboard]::ContainsText()) {
-                    $t = [System.Windows.Forms.Clipboard]::GetText()
-                    return [pscustomobject]@{ Kind = 'text'; Text = $t }
+                # 3. 仮想ファイル (Outlook 添付 / SharePoint 等、Windows パスなし)
+                elseif ([VirtualFileHelper]::HasVirtualFiles()) {
+                    $names = [VirtualFileHelper]::GetFileNames()
+                    return [pscustomobject]@{ Kind = 'vfiles'; Files = $names }
                 }
+                # 4. 音声 (CF_WAVE)
+                elseif ([System.Windows.Forms.Clipboard]::ContainsAudio()) {
+                    $stream = [System.Windows.Forms.Clipboard]::GetAudioStream()
+                    $ms = New-Object System.IO.MemoryStream
+                    try {
+                        $stream.CopyTo($ms)
+                        return [pscustomobject]@{ Kind = 'audio'; Bytes = $ms.ToArray() }
+                    } finally {
+                        if ($stream) { $stream.Dispose() }
+                        if ($ms)     { $ms.Dispose() }
+                    }
+                }
+                # 5. URL (アドレスバー / リンクのコピー)
                 else {
-                    return [pscustomobject]@{ Kind = 'empty' }
+                    $do = [System.Windows.Forms.Clipboard]::GetDataObject()
+                    $url = $null
+                    foreach ($fmt in @('UniformResourceLocatorW', 'UniformResourceLocator')) {
+                        if ($do -and $do.GetDataPresent($fmt)) {
+                            $raw = $do.GetData($fmt)
+                            if ($raw -is [System.IO.Stream]) {
+                                $enc  = if ($fmt -eq 'UniformResourceLocatorW') { [System.Text.Encoding]::Unicode } else { [System.Text.Encoding]::UTF8 }
+                                $buf  = New-Object byte[] 4096
+                                $n    = $raw.Read($buf, 0, $buf.Length)
+                                $url  = $enc.GetString($buf, 0, $n).TrimEnd([char]0, [char]13, [char]10, ' ')
+                            } elseif ($raw -is [string]) {
+                                $url = $raw.Trim()
+                            }
+                            if ($url) { break }
+                        }
+                    }
+                    if ($url -and ($url.StartsWith('http://') -or $url.StartsWith('https://'))) {
+                        return [pscustomobject]@{ Kind = 'url'; Text = $url }
+                    }
+                    # 6. HTML (ブラウザ / Office からのリッチコピー)
+                    elseif ([System.Windows.Forms.Clipboard]::ContainsText([System.Windows.Forms.TextDataFormat]::Html)) {
+                        $raw  = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::Html)
+                        # Windows HTML Format ヘッダを除去して純粋な HTML を返す
+                        $html = $raw
+                        if ($raw -match 'StartHTML:(\d+)') {
+                            $off  = [int]$Matches[1]
+                            $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
+                            if ($off -lt $bytes.Length) {
+                                $html = [System.Text.Encoding]::UTF8.GetString($bytes, $off, $bytes.Length - $off)
+                            }
+                        }
+                        return [pscustomobject]@{ Kind = 'html'; Text = $html }
+                    }
+                    # 7. RTF (Word / Wordpad 等)
+                    elseif ([System.Windows.Forms.Clipboard]::ContainsText([System.Windows.Forms.TextDataFormat]::Rtf)) {
+                        $rtf = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::Rtf)
+                        return [pscustomobject]@{ Kind = 'rtf'; Text = $rtf }
+                    }
+                    # 8. プレーンテキスト
+                    elseif ([System.Windows.Forms.Clipboard]::ContainsText()) {
+                        $t = [System.Windows.Forms.Clipboard]::GetText()
+                        return [pscustomobject]@{ Kind = 'text'; Text = $t }
+                    }
+                    # 9. 空
+                    else {
+                        return [pscustomobject]@{ Kind = 'empty' }
+                    }
                 }
             } catch {
                 if ($i -eq 4) { throw }
@@ -230,9 +420,9 @@ function Send-Bytes {
 }
 
 function Send-Text {
-    param($Context, [string]$Text, [string]$Kind, [int]$Status = 200)
+    param($Context, [string]$Text, [string]$Kind, [int]$Status = 200, [string]$ContentType = 'text/plain; charset=utf-8')
     $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Text)
-    Send-Bytes -Context $Context -Bytes $bytes -ContentType 'text/plain; charset=utf-8' -Kind $Kind -Status $Status
+    Send-Bytes -Context $Context -Bytes $bytes -ContentType $ContentType -Kind $Kind -Status $Status
 }
 
 function Send-Json {
@@ -264,7 +454,7 @@ try {
             }
 
             # 既知パス以外は 404
-            if ($path -ne '/' -and $path -ne '/clip' -and $path -ne '/file') {
+            if ($path -ne '/' -and $path -ne '/clip' -and $path -ne '/file' -and $path -ne '/vfile') {
                 Send-Text -Context $context -Text 'not found' -Kind 'error' -Status 404
                 continue
             }
@@ -323,16 +513,62 @@ try {
                 continue
             }
 
+            # /vfile?i=N: 仮想ファイル (Outlook 添付等) の実体を返す
+            if ($path -eq '/vfile') {
+                $idxStr = $req.QueryString['i']
+                $idx = 0
+                if (-not [int]::TryParse($idxStr, [ref]$idx) -or $idx -lt 0) {
+                    Send-Text -Context $context -Text 'invalid index' -Kind 'error' -Status 400
+                    continue
+                }
+                $capturedIdx = $idx
+                $vfile = (Invoke-InSTA -Script {
+                    param($fileIndex)
+                    Add-Type -AssemblyName System.Windows.Forms
+                    $names = [VirtualFileHelper]::GetFileNames()
+                    if (-not $names -or $fileIndex -ge $names.Length) { return $null }
+                    $bytes = [VirtualFileHelper]::GetFileContents($fileIndex)
+                    if (-not $bytes) { return $null }
+                    return [pscustomobject]@{ Bytes = $bytes; Name = $names[$fileIndex] }
+                } -Arguments @($capturedIdx))[0]
+
+                if (-not $vfile) {
+                    Send-Text -Context $context -Text 'virtual file not available' -Kind 'error' -Status 404
+                    continue
+                }
+                $res = $context.Response
+                try {
+                    $res.StatusCode = 200
+                    $res.Headers.Add('X-Clip-Kind', 'vfile')
+                    $res.Headers.Add('X-Clip-Filename', $vfile.Name)
+                    $res.Headers.Add('Cache-Control', 'no-store')
+                    $res.ContentType = 'application/octet-stream'
+                    $res.ContentLength64 = $vfile.Bytes.Length
+                    $res.OutputStream.Write($vfile.Bytes, 0, $vfile.Bytes.Length)
+                } finally {
+                    $res.OutputStream.Close()
+                }
+                continue
+            }
+
             # / or /clip: 自動判別して返す
             $clip = Read-Clipboard
             switch ($clip.Kind) {
-                'image' { Send-Bytes -Context $context -Bytes $clip.Bytes -ContentType 'image/png' -Kind 'image' }
-                'files' {
+                'image'  { Send-Bytes -Context $context -Bytes $clip.Bytes -ContentType 'image/png' -Kind 'image' }
+                'files'  {
                     $json = if ($null -eq $clip.Files -or $clip.Files.Count -eq 0) { '[]' } else { ConvertTo-Json @($clip.Files) -Compress }
                     Send-Json -Context $context -Json $json -Kind 'files'
                 }
-                'text'  { Send-Text -Context $context -Text $clip.Text -Kind 'text' }
-                default { Send-Text -Context $context -Text '' -Kind 'empty' }
+                'vfiles' {
+                    $json = if ($null -eq $clip.Files -or $clip.Files.Count -eq 0) { '[]' } else { ConvertTo-Json @($clip.Files) -Compress }
+                    Send-Json -Context $context -Json $json -Kind 'vfiles'
+                }
+                'audio'  { Send-Bytes -Context $context -Bytes $clip.Bytes -ContentType 'audio/wav' -Kind 'audio' }
+                'html'   { Send-Text -Context $context -Text $clip.Text -Kind 'html' -ContentType 'text/html; charset=utf-8' }
+                'url'    { Send-Text -Context $context -Text $clip.Text -Kind 'url' }
+                'rtf'    { Send-Text -Context $context -Text $clip.Text -Kind 'rtf' -ContentType 'text/rtf; charset=utf-8' }
+                'text'   { Send-Text -Context $context -Text $clip.Text -Kind 'text' }
+                default  { Send-Text -Context $context -Text '' -Kind 'empty' }
             }
         } catch {
             try {

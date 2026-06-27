@@ -123,6 +123,46 @@ for p in json.load(sys.stdin): print(p)" < "$TMP_BODY")
             done
         fi
         ;;
+    audio)
+        DEST="$(mktemp --suffix=.wav)"
+        cp "$TMP_BODY" "$DEST"
+        if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST"
+        else echo "音声を保存しました: $DEST"; fi
+        ;;
+    url)
+        cat "$TMP_BODY"
+        [[ "$QUIET" -eq 1 ]] || echo
+        ;;
+    html)
+        cat "$TMP_BODY"
+        [[ "$QUIET" -eq 1 ]] || echo
+        ;;
+    rtf)
+        cat "$TMP_BODY"
+        [[ "$QUIET" -eq 1 ]] || echo
+        ;;
+    vfiles)
+        if command -v jq &>/dev/null; then
+            mapfile -t _vnames < <(jq -r '.[]' < "$TMP_BODY")
+        else
+            mapfile -t _vnames < <(python3 -c "
+import json,sys
+for p in json.load(sys.stdin): print(p)" < "$TMP_BODY")
+        fi
+        if [[ "${#_vnames[@]}" -eq 0 ]]; then
+            [[ "$QUIET" -eq 1 ]] || echo "仮想ファイルがありません。"
+        else
+            _auth_flag=""
+            [[ -n "$CLIPD_TOKEN" ]] && _auth_flag="-H 'Authorization: Bearer ${CLIPD_TOKEN}' "
+            [[ "$QUIET" -eq 1 ]] || printf 'クリップボード: 仮想ファイル %d件 (Outlook 添付等)\n\n' "${#_vnames[@]}"
+            for _i in "${!_vnames[@]}"; do
+                _vname="${_vnames[$_i]}"
+                _cmd="curl -fsSL ${_auth_flag}'${BASE}/vfile?i=${_i}' -o '${_vname}'"
+                if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$_cmd"
+                else printf '  [%d] %s\n  → %s\n\n' "$_i" "$_vname" "$_cmd"; fi
+            done
+        fi
+        ;;
     empty|"")
         [[ "$QUIET" -eq 1 ]] || echo "クリップボードは空です。"
         ;;
