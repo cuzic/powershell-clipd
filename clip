@@ -4,7 +4,7 @@
 #
 # 使い方:
 #   clip          クリップボードの中身を自動判別して出す
-#   clip -d DIR   画像の保存先 (既定: ./cc-images)
+#   clip -d DIR   画像の保存先 (既定: mktemp で生成した /tmp 以下)
 #   clip -q       パスや本文だけを出力 (Claude Code に渡しやすい)
 #
 # 事前設定:
@@ -21,7 +21,7 @@ set -euo pipefail
 CLIPD_HOST="${CLIPD_HOST:-}"
 CLIPD_PORT="${CLIPD_PORT:-9999}"
 CLIPD_TOKEN="${CLIPD_TOKEN:-}"
-SAVE_DIR="./cc-images"
+SAVE_DIR=""
 QUIET=0
 
 usage() {
@@ -69,8 +69,12 @@ KIND="$(printf '%s' "$HDRS" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-clip-kind
 
 case "$KIND" in
     image)
-        mkdir -p "$SAVE_DIR"
-        DEST="$SAVE_DIR/clip_$(date +%Y%m%d_%H%M%S).png"
+        if [[ -n "$SAVE_DIR" ]]; then
+            mkdir -p "$SAVE_DIR"
+            DEST="$SAVE_DIR/clip_$(date +%Y%m%d_%H%M%S).png"
+        else
+            DEST="$(mktemp --suffix=.png)"
+        fi
         cp "$TMP_BODY" "$DEST"
         if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST"
         else echo "画像を保存しました: $DEST"; fi

@@ -9,6 +9,7 @@ Tailscale tailnet 内での使用を前提とする。
 |---|---|
 | `clipd.ps1` | Windows 側サーバ。クリップボードを HTTP で返す |
 | `clip` | Linux/Mac 側クライアント。`clipd` を叩いて内容を取得する |
+| `tmux.conf.snippet` | tmux キーバインド設定例 (`<prefix> Ctrl-V` で貼り付け) |
 
 ## 動作イメージ
 
@@ -88,7 +89,7 @@ netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
 ### インストール
 
 ```bash
-curl -o ~/bin/clip https://raw.githubusercontent.com/<user>/powershell-clipd/main/clip
+curl -o ~/bin/clip https://raw.githubusercontent.com/cuzic/powershell-clipd/main/clip
 chmod +x ~/bin/clip
 ```
 
@@ -107,7 +108,7 @@ export CLIPD_TOKEN=secret      # clipd を -Token 付きで起動した場合の
 ```bash
 clip              # クリップボードの内容を自動判別して出力
 clip -q           # パスや本文だけ (Claude Code などに渡しやすい)
-clip -d ~/pics    # 画像の保存先を指定 (既定: ./cc-images)
+clip -d ~/pics    # 画像の保存先を指定 (既定: mktemp で /tmp 以下に生成)
 clip -h           # ヘルプ
 ```
 
@@ -118,9 +119,13 @@ clip -h           # ヘルプ
 $ clip
 コピーしたテキストがここに出る
 
-# 画像の場合
+# 画像の場合 (デフォルトは /tmp 以下の一時ファイル)
 $ clip
-画像を保存しました: ./cc-images/clip_20240627_153000.png
+画像を保存しました: /tmp/tmp.aB3xYz.png
+
+# -d で保存先を指定することも可
+$ clip -d ~/pics
+画像を保存しました: /tmp/tmp.aB3xYz.png  # ← -d ~/pics を付けると ~/pics/clip_TIMESTAMP.png
 
 # ファイルリストの場合
 $ clip
@@ -130,8 +135,33 @@ $ clip
 
 # quiet モード (スクリプトや Claude Code へのパイプ向け)
 $ clip -q
-./cc-images/clip_20240627_153000.png
+/tmp/tmp.aB3xYz.png
 ```
+
+## Claude Code / tmux との連携
+
+Claude Code のキーバインドシステムはシェルコマンドを直接実行する機能を持たないため、
+tmux 経由でペインに貼り付けるのが最もシンプルな方法。
+
+### tmux: `<prefix> Ctrl-V` で貼り付け
+
+`tmux.conf.snippet` の内容を `~/.tmux.conf` に追記する:
+
+```bash
+cat tmux.conf.snippet >> ~/.tmux.conf
+tmux source ~/.tmux.conf
+```
+
+設定内容:
+
+```
+bind C-v run-shell "clip -q | tmux load-buffer - " \; paste-buffer -p
+```
+
+これで `<prefix> Ctrl-V` を押すと:
+- **テキスト** → そのまま現在のペイン (Claude Code 入力欄) に流れる
+- **画像** → `/tmp/tmp.XXX.png` のパスが入力欄に入る → そのまま Enter で Claude Code が画像を読む
+- **ファイル一覧** → JSON パス配列が入力欄に入る
 
 ## ライセンス
 

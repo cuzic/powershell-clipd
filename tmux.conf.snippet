@@ -1,0 +1,12 @@
+# clipd: <prefix> Ctrl-V で Windows クリップボードを現在のペインに貼り付け
+#
+# ~/.tmux.conf に追記して `tmux source ~/.tmux.conf` で反映。
+#
+# 動作:
+#   - テキスト → そのままペインに入力 (Claude Code の入力欄にも流れる)
+#   - 画像     → /tmp/tmp.XXXX.png のパスをペインに入力
+#   - ファイル → JSON パス配列をペインに入力
+#
+# 前提: clip コマンドが PATH に入っており、CLIPD_HOST 等が設定済みであること。
+
+bind C-v run-shell "clip -q | tmux load-buffer - " \; paste-buffer -p
