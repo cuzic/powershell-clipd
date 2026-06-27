@@ -1,12 +1,26 @@
-# clipd: <prefix> Ctrl-V で Windows クリップボードを現在のペインに貼り付け
+# clipd: Windows クリップボードを tmux から使う
 #
 # ~/.tmux.conf に追記して `tmux source ~/.tmux.conf` で反映。
 #
-# 動作:
-#   - テキスト → そのままペインに入力 (Claude Code の入力欄にも流れる)
-#   - 画像     → /tmp/tmp.XXXX.png のパスをペインに入力
-#   - ファイル → JSON パス配列をペインに入力
-#
 # 前提: clip コマンドが PATH に入っており、CLIPD_HOST 等が設定済みであること。
 
+# <prefix> Ctrl-V: クリップボード内容を現在のペイン (Claude Code 等) に貼り付け
+#   - テキスト → そのまま入力
+#   - 画像     → /tmp/tmp.XXX.png のパスを入力 (Claude Code がそのまま読める)
+#   - ファイル → curl コマンド群を入力 → Claude Code が必要なものを実行
 bind C-v run-shell "clip -q | tmux load-buffer - " \; paste-buffer -p
+
+# <prefix> Alt-V: ファイルをその場で展開 (curl コマンドを bash で実行)
+#   テキスト・画像は通常の貼り付けにフォールバック。
+#   ファイルの場合のみ curl を実行してカレントディレクトリにダウンロード。
+bind M-v run-shell " \
+  kind=\$(curl -fsS --max-time 5 \
+    \${CLIPD_TOKEN:+-H \"Authorization: Bearer \$CLIPD_TOKEN\"} \
+    -D - -o /dev/null \
+    \"http://\${CLIPD_HOST}:\${CLIPD_PORT:-9999}/clip\" 2>/dev/null \
+    | tr -d '\\r' | awk -F': ' 'tolower(\$1)==\"x-clip-kind\"{print \$2}'); \
+  if [ \"\$kind\" = files ]; then \
+    clip -q | bash; \
+  else \
+    clip -q | tmux load-buffer - && tmux paste-buffer -p; \
+  fi"

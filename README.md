@@ -73,7 +73,7 @@ netsh http add urlacl url=http://<tailscale-ip>:9999/ user="DOMAIN\username"
 |---|---|
 | `GET /` | クリップボード自動判別 |
 | `GET /clip` | 同上 |
-| `GET /file?i=N` | FileDropList の N 番目のファイルをストリーム (認証あり) |
+| `GET /file?path=<encoded>` | クリップボードに存在するパスのファイルをストリーム (認証あり) |
 | `GET /health` | 死活確認 (認証不要) |
 
 レスポンスヘッダ `X-Clip-Kind` に種別が入る:
@@ -128,15 +128,20 @@ $ clip
 $ clip -d ~/pics
 画像を保存しました: /tmp/tmp.aB3xYz.png  # ← -d ~/pics を付けると ~/pics/clip_TIMESTAMP.png
 
-# ファイルリストの場合 → そのままダウンロード
+# ファイルリストの場合 → パスと取得コマンドを表示 (実行は Claude Code に委ねる)
 $ clip
-取得: ./foo.txt
-取得: ./bar.png
+クリップボード: ファイル 2件
 
-# -d で保存先ディレクトリを指定
-$ clip -d ~/downloads
-取得: /home/user/downloads/foo.txt
-取得: /home/user/downloads/bar.png
+  C:\Users\user\Desktop\foo.txt
+  → curl -fsSL 'http://my-windows:9999/file?path=C%3A%5CUsers%5Cuser%5CDesktop%5Cfoo.txt' -o 'foo.txt'
+
+  C:\Users\user\Desktop\bar.png
+  → curl -fsSL 'http://my-windows:9999/file?path=...' -o 'bar.png'
+
+# quiet モード: curl コマンドだけ出力 (Claude Code やシェルへのパイプ向け)
+$ clip -q
+curl -fsSL 'http://my-windows:9999/file?path=C%3A%5C...' -o 'foo.txt'
+curl -fsSL 'http://my-windows:9999/file?path=...' -o 'bar.png'
 
 # quiet モード (スクリプトや Claude Code へのパイプ向け)
 $ clip -q
@@ -166,7 +171,11 @@ bind C-v run-shell "clip -q | tmux load-buffer - " \; paste-buffer -p
 これで `<prefix> Ctrl-V` を押すと:
 - **テキスト** → そのまま現在のペイン (Claude Code 入力欄) に流れる
 - **画像** → `/tmp/tmp.XXX.png` のパスが入力欄に入る → そのまま Enter で Claude Code が画像を読む
-- **ファイル一覧** → JSON パス配列が入力欄に入る
+- **ファイル一覧** → curl コマンド群が入力欄に入る → Claude Code が必要なものを実行
+
+`<prefix> Alt-V` はファイルの場合のみ curl コマンドをその場で bash 実行し、カレントディレクトリにダウンロードします。テキスト・画像は通常の貼り付けにフォールバックします。
+
+**セキュリティ:** `/file?path=` は今クリップボードにあるパスのみ許可します。任意のパスは 403 で拒否されます。
 
 ## ライセンス
 

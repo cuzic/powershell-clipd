@@ -278,24 +278,30 @@ try {
                 }
             }
 
-            # /file?i=N: クリップボードの FileDropList の N 番目を返す
+            # /file?path=<encoded>: クリップボードの FileDropList にあるファイルのみ返す
             if ($path -eq '/file') {
-                $idxStr = $req.QueryString['i']
-                $idx = 0
-                if (-not [int]::TryParse($idxStr, [ref]$idx) -or $idx -lt 0) {
-                    Send-Text -Context $context -Text 'invalid index' -Kind 'error' -Status 400
+                # HttpListener は QueryString を自動デコードする
+                $filePath = $req.QueryString['path']
+                if (-not $filePath) {
+                    Send-Text -Context $context -Text 'missing path parameter' -Kind 'error' -Status 400
                     continue
                 }
+
+                # セキュリティ: 今クリップボードにあるパスのみ許可
                 $clip = Read-Clipboard
                 if ($clip.Kind -ne 'files') {
                     Send-Text -Context $context -Text 'no files in clipboard' -Kind 'error' -Status 409
                     continue
                 }
-                if ($idx -ge $clip.Files.Count) {
-                    Send-Text -Context $context -Text 'index out of range' -Kind 'error' -Status 404
+                $requestFull = [System.IO.Path]::GetFullPath($filePath)
+                $allowed = $clip.Files | Where-Object {
+                    [System.IO.Path]::GetFullPath($_) -eq $requestFull
+                }
+                if (-not $allowed) {
+                    Send-Text -Context $context -Text 'path not in clipboard' -Kind 'error' -Status 403
                     continue
                 }
-                $filePath = $clip.Files[$idx]
+
                 $fileName = [System.IO.Path]::GetFileName($filePath)
                 $res = $context.Response
                 try {

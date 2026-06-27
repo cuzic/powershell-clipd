@@ -84,27 +84,42 @@ case "$KIND" in
         [[ "$QUIET" -eq 1 ]] || echo
         ;;
     files)
-        DEST_DIR="${SAVE_DIR:-.}"
-        mkdir -p "$DEST_DIR"
-
+        # パスを JSON 配列から取り出す
         if command -v jq &>/dev/null; then
-            COUNT=$(jq 'length' < "$TMP_BODY")
+            mapfile -t _paths < <(jq -r '.[]' < "$TMP_BODY")
         else
-            COUNT=$(python3 -c "import json,sys; print(len(json.load(sys.stdin)))" < "$TMP_BODY")
+            mapfile -t _paths < <(python3 -c "
+import json,sys
+for p in json.load(sys.stdin): print(p)" < "$TMP_BODY")
         fi
 
-        if [[ "$COUNT" -eq 0 ]]; then
+        if [[ "${#_paths[@]}" -eq 0 ]]; then
             [[ "$QUIET" -eq 1 ]] || echo "クリップボードにファイルがありません。"
         else
-            _fc=(-fsS --max-time 300)
-            [[ -n "$CLIPD_TOKEN" ]] && _fc+=(-H "Authorization: Bearer $CLIPD_TOKEN")
-            for i in $(seq 0 $((COUNT - 1))); do
-                _tmp=$(mktemp)
-                _fhdrs=$(curl "${_fc[@]}" -D - -o "$_tmp" "$BASE/file?i=$i")
-                _fname=$(printf '%s' "$_fhdrs" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-clip-filename"{print $2}')
-                mv "$_tmp" "$DEST_DIR/$_fname"
-                if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST_DIR/$_fname"
-                else echo "取得: $DEST_DIR/$_fname"; fi
+            # トークンヘッダ部 (コマンド文字列に埋め込む)
+            _auth_flag=""
+            [[ -n "$CLIPD_TOKEN" ]] && _auth_flag="-H 'Authorization: Bearer ${CLIPD_TOKEN}' "
+
+            [[ "$QUIET" -eq 1 ]] || echo "クリップボード: ファイル ${#_paths[@]}件"
+            [[ "$QUIET" -eq 1 ]] || echo
+
+            for _winpath in "${_paths[@]}"; do
+                # Windows パスを URL エンコード
+                if command -v jq &>/dev/null; then
+                    _enc=$(jq -rn --arg p "$_winpath" '$p | @uri')
+                else
+                    _enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$_winpath")
+                fi
+                _fname=$(printf '%s' "$_winpath" | tr '\\' '/' | xargs basename)
+                _cmd="curl -fsSL ${_auth_flag}'${BASE}/file?path=${_enc}' -o '${_fname}'"
+
+                if [[ "$QUIET" -eq 1 ]]; then
+                    printf '%s\n' "$_cmd"
+                else
+                    echo "  $_winpath"
+                    echo "  → $_cmd"
+                    echo
+                fi
             done
         fi
         ;;
