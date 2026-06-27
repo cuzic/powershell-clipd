@@ -80,8 +80,16 @@ case "$KIND" in
         else echo "画像を保存しました: $DEST"; fi
         ;;
     text)
-        cat "$TMP_BODY"
-        [[ "$QUIET" -eq 1 ]] || echo
+        # 8KB 超はファイルに保存してパスを渡す (history.jsonl 肥大化防止)
+        if [[ $(wc -c < "$TMP_BODY") -gt 8192 ]]; then
+            DEST="$(mktemp --suffix=.txt)"
+            cp "$TMP_BODY" "$DEST"
+            if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST"
+            else echo "テキストを保存しました (大容量): $DEST"; fi
+        else
+            cat "$TMP_BODY"
+            [[ "$QUIET" -eq 1 ]] || echo
+        fi
         ;;
     files)
         # パスを JSON 配列から取り出す
@@ -130,16 +138,23 @@ for p in json.load(sys.stdin): print(p)" < "$TMP_BODY")
         else echo "音声を保存しました: $DEST"; fi
         ;;
     url)
+        # URL は常にインライン (短いため history に残っても問題なし)
         cat "$TMP_BODY"
         [[ "$QUIET" -eq 1 ]] || echo
         ;;
     html)
-        cat "$TMP_BODY"
-        [[ "$QUIET" -eq 1 ]] || echo
+        # HTML は常にファイルに保存してパスを渡す (history.jsonl 肥大化防止)
+        DEST="$(mktemp --suffix=.html)"
+        cp "$TMP_BODY" "$DEST"
+        if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST"
+        else echo "HTML を保存しました: $DEST"; fi
         ;;
     rtf)
-        cat "$TMP_BODY"
-        [[ "$QUIET" -eq 1 ]] || echo
+        # RTF も常にファイルに保存してパスを渡す
+        DEST="$(mktemp --suffix=.rtf)"
+        cp "$TMP_BODY" "$DEST"
+        if [[ "$QUIET" -eq 1 ]]; then printf '%s\n' "$DEST"
+        else echo "RTF を保存しました: $DEST"; fi
         ;;
     vfiles)
         if command -v jq &>/dev/null; then
