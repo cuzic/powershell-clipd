@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# wclip - stdin の内容を Windows クリップボードに書き込む
+#
+# 使い方:
+#   echo "テキスト"  | wclip
+#   cat file.txt     | wclip
+#   wclip < file.txt
+#
+#   # Claude Code の最新レスポンスを Windows クリップボードへ
+#   claude-last | wclip
+#
+#   # 現在のタスクリストを Windows クリップボードへ
+#   claude --print tasks | wclip
+#
+# 事前設定:
+#   export CLIPD_HOST=my-windows   # Tailscale MagicDNS 名 or 100.x.y.z
+#   export CLIPD_PORT=9999         # 省略可 (既定 9999)
+#   export CLIPD_TOKEN=secret      # clipwire を --token 付きで起動した場合のみ
+
+set -euo pipefail
+
+CLIPD_HOST="${CLIPD_HOST:-}"
+CLIPD_PORT="${CLIPD_PORT:-9999}"
+CLIPD_TOKEN="${CLIPD_TOKEN:-}"
+
+if [[ -z "$CLIPD_HOST" ]]; then
+    echo "error: CLIPD_HOST is not set. e.g. export CLIPD_HOST=my-windows" >&2
+    exit 1
+fi
+
+CURL_ARGS=(-fsS --max-time 30 -X POST
+           -H "Content-Type: text/plain; charset=utf-8"
+           --data-binary @-)
+if [[ -n "$CLIPD_TOKEN" ]]; then
+    CURL_ARGS+=(-H "Authorization: Bearer $CLIPD_TOKEN")
+fi
+
+if ! curl "${CURL_ARGS[@]}" "http://${CLIPD_HOST}:${CLIPD_PORT}/clip"; then
+    echo "error: failed to write to Windows clipboard" >&2
+    exit 1
+fi

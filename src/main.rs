@@ -16,7 +16,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use clap::Parser;
 use serde::Deserialize;
@@ -61,6 +61,7 @@ enum ClipKind {
 
 enum ClipRequest {
     GetClip  { reply: oneshot::Sender<ClipKind> },
+    SetClip  { text: String,   reply: oneshot::Sender<Result<()>> },
     GetFile  { path: String,   reply: oneshot::Sender<Option<Vec<u8>>> },
     GetVFile { index: usize,   reply: oneshot::Sender<Option<Vec<u8>>> },
 }
@@ -94,10 +95,11 @@ mod win_clip {
                     STGMEDIUM, TYMED_HGLOBAL, TYMED_ISTREAM,
                 },
                 DataExchange::{
-                    CloseClipboard, GetClipboardData, IsClipboardFormatAvailable,
-                    OpenClipboard, RegisterClipboardFormatW,
+                    CloseClipboard, EmptyClipboard, GetClipboardData,
+                    IsClipboardFormatAvailable, OpenClipboard,
+                    RegisterClipboardFormatW, SetClipboardData,
                 },
-                Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+                Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
                 Ole::{OleGetClipboard, OleInitialize, ReleaseStgMedium},
                 Threading::CreateMutexW,
             },
@@ -346,6 +348,30 @@ mod win_clip {
         Ok(String::from_utf16_lossy(&words[..end]).into_owned())
     }
 
+    // ── Clipboard write ───────────────────────────────────────────────────────
+
+    pub unsafe fn write_clipboard_text(text: &str) -> Result<()> {
+        // Encode as UTF-16LE with null terminator
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let byte_len = wide.len() * 2;
+
+        let hg = GlobalAlloc(GMEM_MOVEABLE, byte_len)?;
+        let ptr = GlobalLock(hg) as *mut u16;
+        if ptr.is_null() { bail!("GlobalLock failed"); }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        let _ = GlobalUnlock(hg);
+
+        OpenClipboard(None)?;
+        EmptyClipboard()?;
+        // SetClipboardData takes ownership of hg on success; do not free it
+        if let Err(e) = SetClipboardData(CF_UNICODETEXT, HANDLE(hg.0)) {
+            let _ = CloseClipboard();
+            bail!("SetClipboardData: {e}");
+        }
+        CloseClipboard()?;
+        Ok(())
+    }
+
     // ── Balloon notification ──────────────────────────────────────────────────
 
     pub fn show_balloon(msg: &str) {
@@ -409,6 +435,9 @@ mod win_clip {
                 match req {
                     ClipRequest::GetClip { reply } => {
                         let _ = reply.send(read_clipboard());
+                    }
+                    ClipRequest::SetClip { text, reply } => {
+                        let _ = reply.send(write_clipboard_text(&text));
                     }
                     ClipRequest::GetFile { path, reply } => {
                         let _ = reply.send(std::fs::read(&path).ok());
@@ -528,6 +557,29 @@ fn clip_resp(kind: &str, ct: &str, body: Vec<u8>) -> Response {
         .header(header::CONTENT_TYPE, ct)
         .body(Body::from(body))
         .unwrap()
+}
+
+async fn handle_clip_post(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !check_auth(&s.token, &headers) { return unauthorized(); }
+
+    let text = match String::from_utf8(body.to_vec()) {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Body must be UTF-8\n").into_response(),
+    };
+
+    let (tx, rx) = oneshot::channel();
+    if s.clip_tx.send(ClipRequest::SetClip { text, reply: tx }).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => (StatusCode::NO_CONTENT, "").into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+        Err(_)     => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -666,7 +718,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/",       get(handle_clip))
-        .route("/clip",   get(handle_clip))
+        .route("/clip",   get(handle_clip).post(handle_clip_post))
         .route("/file",   get(handle_file))
         .route("/vfile",  get(handle_vfile))
         .with_state(state.clone());
