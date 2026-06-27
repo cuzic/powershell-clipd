@@ -111,37 +111,40 @@ def cmd_last(entries):
 
 
 def cmd_tasks(entries):
-    """最新のタスク状態を返す (TaskCreate/TaskUpdate を追跡)"""
-    tasks: dict[str, dict] = {}
-    for entry in entries:
-        role = entry.get("message", {}).get("role") or entry.get("role")
-        content = entry.get("message", {}).get("content") or entry.get("content", "")
-        if role != "assistant":
-            continue
-        for t in task_blocks(content):
-            inp = t["input"]
-            if t["tool"] == "TaskCreate":
-                tid = inp.get("id") or inp.get("title", "?")
-                tasks[tid] = {
-                    "title":  inp.get("title", tid),
-                    "status": inp.get("status", "pending"),
-                    "notes":  inp.get("notes", ""),
-                }
-            elif t["tool"] == "TaskUpdate":
-                tid = inp.get("id", "?")
-                if tid in tasks:
-                    tasks[tid].update({k: v for k, v in inp.items() if k != "id"})
+    """~/.claude/tasks/session-<id>/ から直接タスクを読む"""
+    session_file = find_session_file()
+    session_id   = session_file.stem  # UUID 部分
+    short_id     = session_id.split("-")[0]  # 先頭8文字
 
-    if not tasks:
+    tasks_dir = Path.home() / ".claude" / "tasks" / f"session-{short_id}"
+    if not tasks_dir.exists():
         return "(このセッションにタスクはありません)"
 
+    tasks = []
+    for f in sorted(tasks_dir.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0):
+        try:
+            t = json.loads(f.read_text())
+            tasks.append(t)
+        except Exception:
+            continue
+
+    if not tasks:
+        return "(タスクファイルが空です)"
+
+    status_icon = {"completed": "✓", "in_progress": "→", "pending": "·", "deleted": "✗"}
     lines = ["# タスクリスト\n"]
-    status_icon = {"completed": "✓", "in_progress": "→", "pending": "·"}
-    for tid, t in tasks.items():
-        icon = status_icon.get(t.get("status", ""), "·")
-        lines.append(f"{icon} {t['title']}  [{t.get('status','?')}]")
-        if t.get("notes"):
-            lines.append(f"  {t['notes']}")
+    for t in tasks:
+        status = t.get("status", "?")
+        if status == "deleted":
+            continue
+        icon = status_icon.get(status, "·")
+        tid  = t.get("id", "?")
+        subj = t.get("subject", "?")
+        lines.append(f"{icon} #{tid} {subj}  [{status}]")
+        if t.get("description"):
+            # 説明文は1行目だけ表示
+            first_line = t["description"].split("\n")[0][:80]
+            lines.append(f"    {first_line}")
     return "\n".join(lines)
 
 
