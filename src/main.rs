@@ -587,7 +587,8 @@ mod win_clip {
             System::{
                 Com::{
                     CoInitializeEx, CoUninitialize, IStream,
-                    COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
+                    COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+                    DVASPECT_CONTENT, FORMATETC,
                     TYMED_HGLOBAL, TYMED_ISTREAM,
                 },
                 DataExchange::{
@@ -844,11 +845,11 @@ mod win_clip {
 
     pub fn show_balloon(msg: &str) {
         let msg = msg.to_string();
-        std::thread::spawn(move || { let _ = show_toast(&msg); });
+        std::thread::spawn(move || { let _ = show_simple_toast(&msg); });
     }
 
     #[allow(unused_variables)]
-    fn show_toast(msg: &str) -> Result<()> {
+    fn show_simple_toast(msg: &str) -> Result<()> {
         std::process::Command::new("powershell")
             .args([
                 "-NoProfile", "-WindowStyle", "Hidden", "-Command",
@@ -864,6 +865,101 @@ mod win_clip {
                 ),
             ])
             .spawn()?;
+        Ok(())
+    }
+
+    /// `register` 要求到着時に WinRT toast（承認/拒否ボタン付き）を表示する。
+    /// 「承認」クリック → 同プロセス内の Activated ハンドラが registered.toml に直接書き込む。
+    pub fn show_register_toast(
+        name: String,
+        entry: super::StoredTarget,
+        config_dir: std::path::PathBuf,
+        reapproval: bool,
+    ) {
+        std::thread::spawn(move || {
+            if let Err(e) = show_register_toast_impl(name, entry, config_dir, reapproval) {
+                eprintln!("[clipwire] register toast error: {e}");
+            }
+        });
+    }
+
+    fn show_register_toast_impl(
+        name: String,
+        entry: super::StoredTarget,
+        config_dir: std::path::PathBuf,
+        reapproval: bool,
+    ) -> Result<()> {
+        use windows::{
+            core::HSTRING,
+            Data::Xml::Dom::XmlDocument,
+            Foundation::TypedEventHandler,
+            UI::Notifications::{
+                ToastActivatedEventArgs, ToastDismissedEventArgs,
+                ToastNotification, ToastNotificationManager,
+            },
+        };
+
+        // MTA で WinRT を初期化
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()?; }
+
+        let body = if reapproval {
+            format!("'{}' の設定が変更されました。再承認しますか？", name)
+        } else {
+            format!("'{}' を承認しますか？", name)
+        };
+        let xml_str = format!(
+            r#"<toast><visual><binding template="ToastGeneric"><text>clipwire: 登録要求</text><text>{body}</text></binding></visual><actions><action content="承認" arguments="approve"/><action content="拒否" arguments="deny"/></actions></toast>"#
+        );
+
+        let xml = XmlDocument::new()?;
+        xml.LoadXml(&HSTRING::from(xml_str.as_str()))?;
+        let toast = ToastNotification::CreateToastNotification(&xml)?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+
+        {
+            let tx = tx.clone();
+            toast.Activated(&TypedEventHandler::<ToastNotification, windows::core::IInspectable>::new(
+                move |_, args| {
+                    let approved = args
+                        .as_ref()
+                        .and_then(|a| a.cast::<ToastActivatedEventArgs>().ok())
+                        .and_then(|a| a.Arguments().ok())
+                        .map(|s| s == "approve")
+                        .unwrap_or(false);
+                    let _ = tx.send(approved);
+                    Ok(())
+                },
+            ))?;
+        }
+        {
+            let tx = tx.clone();
+            toast.Dismissed(&TypedEventHandler::<ToastNotification, ToastDismissedEventArgs>::new(
+                move |_, _| { let _ = tx.send(false); Ok(()) },
+            ))?;
+        }
+
+        // 未パッケージアプリは既存 AUMID を借用する（cmd.exe）
+        let notifier = ToastNotificationManager::CreateToastNotifierWithId(
+            &HSTRING::from("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\cmd.exe"),
+        )?;
+        notifier.Show(&toast)?;
+
+        // ユーザー操作を最大 10 分待機
+        if rx.recv_timeout(std::time::Duration::from_secs(600)).unwrap_or(false) {
+            let registered_path = config_dir.join("registered.toml");
+            let pending_path    = config_dir.join("pending.toml");
+            let mut registered = super::load_target_map(&registered_path).unwrap_or_default();
+            let mut pending    = super::load_target_map(&pending_path).unwrap_or_default();
+            registered.insert(name.clone(), entry);
+            pending.remove(&name);
+            super::save_target_map(&registered_path, &registered)?;
+            super::save_target_map(&pending_path, &pending)?;
+            eprintln!("[clipwire] '{}' 承認 → registered.toml", name);
+            show_balloon(&format!("'{}' を承認しました", name));
+        }
+
+        unsafe { CoUninitialize(); }
         Ok(())
     }
 
@@ -1024,6 +1120,8 @@ async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: ax
 
     // 既承認済みの場合は取り消して再承認を要求
     let reapproval = registered.remove(&req.name).is_some();
+    #[cfg(windows)]
+    let entry_for_toast = entry.clone();
     pending.insert(req.name.clone(), entry);
 
     if let Err(e) = save_target_map(&pending_path, &pending)
@@ -1033,12 +1131,14 @@ async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: ax
     }
 
     let msg = if reapproval {
-        format!("'{}' の設定が変更されました。再承認が必要です: clipwire approve {}", req.name, req.name)
+        format!("'{}' の設定が変更されました。アクションセンターで承認してください", req.name)
     } else {
-        format!("'{}' の登録要求を受信。承認してください: clipwire approve {}", req.name, req.name)
+        format!("'{}' の登録要求を受信。アクションセンターで承認してください", req.name)
     };
     #[cfg(windows)]
-    win_clip::show_balloon(&msg);
+    win_clip::show_register_toast(req.name.clone(), entry_for_toast, s.config_dir.clone(), reapproval);
+    #[cfg(not(windows))]
+    eprintln!("{msg}");
 
     (StatusCode::OK, format!("{msg}\n")).into_response()
 }
