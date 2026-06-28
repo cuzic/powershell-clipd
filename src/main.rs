@@ -29,7 +29,7 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
@@ -55,6 +55,8 @@ enum Cmd {
     Put(PutArgs),
     /// Windows のデフォルトブラウザで Web サービスを開く
     Open(OpenArgs),
+    /// Linux の設定ファイルで定義したコマンドを Windows で実行して結果を取得
+    Exec(ExecArgs),
 }
 
 #[derive(Args, Debug)]
@@ -122,6 +124,39 @@ impl OpenTarget {
             Self::Tailscale => "tailscale",
         }
     }
+}
+
+#[derive(Args, Debug)]
+struct ExecArgs {
+    /// 実行するターゲット名 (~/.config/clipwire/targets.toml で定義)
+    target: String,
+}
+
+// ── Exec target config ────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct TargetsFile {
+    targets: std::collections::HashMap<String, ExecTarget>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExecTarget {
+    cmd: String,
+    dir: Option<String>,
+}
+
+fn load_exec_target(name: &str) -> Result<ExecTarget> {
+    let path = dirs_next::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+        .join("clipwire")
+        .join("targets.toml");
+    let src = std::fs::read_to_string(&path)
+        .with_context(|| format!("設定ファイルが見つかりません: {}", path.display()))?;
+    let file: TargetsFile = toml::from_str(&src)?;
+    file.targets.into_iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v)
+        .with_context(|| format!("ターゲット '{}' が定義されていません", name))
 }
 
 // ── Client config ─────────────────────────────────────────────────────────────
@@ -282,6 +317,33 @@ fn cmd_put(cfg: &ClientConfig) -> Result<()> {
         }
         Err(e) => bail!("{} への送信に失敗: {}", cfg.base_url(), e),
     }
+}
+
+// ── Client: exec ──────────────────────────────────────────────────────────────
+
+fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
+    let target = load_exec_target(&args.target)?;
+    let body = serde_json::json!({
+        "cmd": target.cmd,
+        "dir": target.dir,
+    });
+    let url = format!("{}/exec", cfg.base_url());
+    let req = cfg.set_auth(
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(600)),
+    );
+    let resp = match req.send_string(&body.to_string()) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(ureq::Error::Status(503, r)) => bail!("{}", r.into_string().unwrap_or_default().trim()),
+        Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
+    };
+    let exit_code: i32 = resp.header("X-Exit-Code").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let output = resp.into_string()?;
+    print!("{output}");
+    if exit_code != 0 { bail!("exit code {exit_code}"); }
+    Ok(())
 }
 
 // ── Client: open ──────────────────────────────────────────────────────────────
@@ -799,6 +861,43 @@ async fn handle_clip_post(State(s): State<AppState>, headers: HeaderMap, body: a
 #[derive(Deserialize)] struct VFileQuery { i: usize }
 #[derive(Deserialize)] struct OpenQuery  { name: String }
 
+async fn handle_exec(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    if !check_auth(&s.token, &headers) { return unauthorized(); }
+
+    #[derive(serde::Deserialize)]
+    struct ExecReq { cmd: String, dir: Option<String> }
+
+    let req: ExecReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response(),
+    };
+
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/c") } else { ("sh", "-c") };
+    let mut command = tokio::process::Command::new(shell);
+    command.args([flag, &req.cmd]);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    if let Some(dir) = &req.dir {
+        command.current_dir(dir);
+    }
+
+    let output = match command.output().await {
+        Ok(o) => o,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("実行エラー: {e}\n")).into_response(),
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let mut combined = output.stderr;
+    combined.extend_from_slice(&output.stdout);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("X-Exit-Code", exit_code.to_string())
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(combined))
+        .unwrap()
+}
+
 async fn handle_open(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<OpenQuery>) -> Response {
     if !check_auth(&s.token, &headers) { return unauthorized(); }
     let url = match q.name.as_str() {
@@ -918,6 +1017,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         .route("/file",   get(handle_file))
         .route("/vfile",  get(handle_vfile))
         .route("/open",   get(handle_open))
+        .route("/exec",   post(handle_exec))
         .with_state(state.clone());
 
     let localhost = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -971,6 +1071,10 @@ fn main() -> Result<()> {
         Cmd::Open(args) => {
             let cfg = ClientConfig::from_env()?;
             cmd_open(&cfg, &args)
+        }
+        Cmd::Exec(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_exec(&cfg, &args)
         }
     }
 }
