@@ -95,6 +95,10 @@ struct ServeArgs {
     /// トークンなしで tailnet に公開することを明示許可
     #[arg(long)]
     allow_no_token: bool,
+
+    /// register リクエストを自動承認する (approve 不要)
+    #[arg(long)]
+    auto_approve: bool,
 }
 
 #[derive(Args, Debug)]
@@ -433,7 +437,8 @@ fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
 fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()> {
     let target = load_exec_target(&args.target)?;
     let mut body = serde_json::to_value(&target)?;
-    body.as_object_mut().unwrap().insert("name".into(), args.target.clone().into());
+    let obj = body.as_object_mut().unwrap();
+    obj.insert("name".into(), args.target.clone().into());
     let url = format!("{}/register", cfg.base_url());
     let req = cfg.set_auth(
         ureq::post(&url)
@@ -441,7 +446,7 @@ fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()> {
             .timeout(Duration::from_secs(30)),
     );
     match req.send_string(&body.to_string()) {
-        Ok(_) => { println!("'{}' を Windows の承認待ちに追加しました。Windows で clipwire approve {} を実行してください", args.target, args.target); Ok(()) }
+        Ok(r) => { print!("{}", r.into_string().unwrap_or_default()); Ok(()) }
         Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
         Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
     }
@@ -569,10 +574,11 @@ struct LastClip {
 
 #[derive(Clone)]
 struct AppState {
-    clip_tx:    mpsc::SyncSender<ClipRequest>,
-    token:      Option<String>,
-    last_clip:  Arc<Mutex<LastClip>>,
-    config_dir: PathBuf,
+    clip_tx:      mpsc::SyncSender<ClipRequest>,
+    token:        Option<String>,
+    last_clip:    Arc<Mutex<LastClip>>,
+    config_dir:   PathBuf,
+    auto_approve: bool,
 }
 
 // ── Windows clipboard implementation ──────────────────────────────────────────
@@ -1138,15 +1144,22 @@ async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: ax
         Err(e) => return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response(),
     };
 
-    let entry = req.target;
+    let entry           = req.target;
     let pending_path    = s.config_dir.join("pending.toml");
     let registered_path = s.config_dir.join("registered.toml");
+    let mut registered  = load_target_map(&registered_path).unwrap_or_default();
 
-    let mut pending    = load_target_map(&pending_path).unwrap_or_default();
-    let mut registered = load_target_map(&registered_path).unwrap_or_default();
+    if s.auto_approve {
+        registered.insert(req.name.clone(), entry);
+        if let Err(e) = save_target_map(&registered_path, &registered) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("保存エラー: {e}\n")).into_response();
+        }
+        return (StatusCode::OK, format!("'{}' を登録しました\n", req.name)).into_response();
+    }
 
-    // 既承認済みの場合は取り消して再承認を要求
+    // 通常フロー: pending に追加、既承認分は取り消し
     let reapproval = registered.remove(&req.name).is_some();
+    let mut pending = load_target_map(&pending_path).unwrap_or_default();
     #[cfg(windows)]
     let entry_for_toast = entry.clone();
     pending.insert(req.name.clone(), entry);
@@ -1158,9 +1171,9 @@ async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: ax
     }
 
     let msg = if reapproval {
-        format!("'{}' の設定が変更されました。アクションセンターで承認してください", req.name)
+        format!("'{}' の設定が変更されました。Windows で clipwire approve {} を実行してください", req.name, req.name)
     } else {
-        format!("'{}' の登録要求を受信。アクションセンターで承認してください", req.name)
+        format!("'{}' を承認待ちに追加しました。Windows で clipwire approve {} を実行してください", req.name, req.name)
     };
     #[cfg(windows)]
     win_clip::show_register_toast(req.name.clone(), entry_for_toast, s.config_dir.clone(), reapproval);
@@ -1433,9 +1446,10 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
     let state = AppState {
         clip_tx,
-        token:      args.token.clone(),
-        last_clip:  Arc::new(Mutex::new(LastClip::default())),
-        config_dir: clipwire_config_dir(),
+        token:        args.token.clone(),
+        last_clip:    Arc::new(Mutex::new(LastClip::default())),
+        config_dir:   clipwire_config_dir(),
+        auto_approve: args.auto_approve,
     };
 
     let app = Router::new()
