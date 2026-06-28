@@ -330,7 +330,7 @@ mod win_clip {
             Foundation::{GetLastError, HANDLE, HGLOBAL, WIN32_ERROR},
             System::{
                 Com::{
-                    CoInitializeEx, CoUninitialize, IDataObject, IStream,
+                    CoInitializeEx, CoUninitialize, IStream,
                     COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
                     STGMEDIUM, TYMED_HGLOBAL, TYMED_ISTREAM,
                 },
@@ -482,20 +482,24 @@ mod win_clip {
             ptd:      std::ptr::null_mut(),
             dwAspect: DVASPECT_CONTENT.0 as u32,
             lindex:   index as i32,
-            tymed:    TYMED_ISTREAM.0 as u32,
+            tymed:    TYMED_ISTREAM.0,
         };
-        let mut stgm = STGMEDIUM::default();
 
-        if data_obj.GetData(&fetc, &mut stgm).is_ok() && stgm.tymed == TYMED_ISTREAM {
-            let stream: &Option<IStream> = &*stgm.Anonymous.pstm;
-            let data = if let Some(s) = stream { drain_istream(s)? } else { bail!("null IStream") };
+        if let Ok(mut stgm) = data_obj.GetData(&fetc) {
+            if stgm.tymed == TYMED_ISTREAM.0 {
+                let data = {
+                    let stream: &Option<IStream> = &*stgm.u.pstm;
+                    if let Some(s) = stream { drain_istream(s)? } else { bail!("null IStream") }
+                };
+                ReleaseStgMedium(&mut stgm);
+                return Ok(data);
+            }
             ReleaseStgMedium(&mut stgm);
-            return Ok(data);
         }
 
-        fetc.tymed = TYMED_HGLOBAL.0 as u32;
-        data_obj.GetData(&fetc, &mut stgm)?;
-        let hg   = stgm.Anonymous.hGlobal;
+        fetc.tymed = TYMED_HGLOBAL.0;
+        let mut stgm = data_obj.GetData(&fetc)?;
+        let hg   = stgm.u.hGlobal;
         let size = GlobalSize(hg);
         let ptr  = GlobalLock(hg);
         let data = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
