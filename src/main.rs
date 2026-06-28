@@ -343,9 +343,9 @@ mod win_clip {
                 Ole::{OleGetClipboard, OleInitialize, ReleaseStgMedium},
                 Threading::CreateMutexW,
             },
-            UI::Shell::DragQueryFileW,
+            UI::Shell::{DragQueryFileW, HDROP},
         },
-        core::{w, PWSTR},
+        core::w,
     };
 
     const CF_DIB:         u32 = 8;
@@ -433,14 +433,14 @@ mod win_clip {
     unsafe fn read_files() -> Result<Vec<String>> {
         let _g    = ClipGuard::open()?;
         let h     = GetClipboardData(CF_HDROP).context("CF_HDROP")?;
-        let count = DragQueryFileW(h, 0xFFFF_FFFF, PWSTR::null(), 0);
+        let hdrop = HDROP(h.0);
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
         let mut paths = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let len = DragQueryFileW(h, i, PWSTR::null(), 0) as usize + 1;
-            let mut buf = vec![0u16; len];
-            DragQueryFileW(h, i, PWSTR(buf.as_mut_ptr()), len as u32);
-            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            paths.push(String::from_utf16_lossy(&buf[..end]).into_owned());
+            let len = DragQueryFileW(hdrop, i, None) as usize;
+            let mut buf = vec![0u16; len + 1];
+            DragQueryFileW(hdrop, i, Some(&mut buf));
+            paths.push(String::from_utf16_lossy(&buf[..len]));
         }
         Ok(paths)
     }
@@ -466,7 +466,7 @@ mod win_clip {
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
-            names.push(String::from_utf16_lossy(&words[..end]).into_owned());
+            names.push(String::from_utf16_lossy(&words[..end]));
         }
         Ok(names)
     }
@@ -475,9 +475,7 @@ mod win_clip {
         let fmt_fc = reg_fmt(w!("FileContents"));
         let _ = OleInitialize(None);
 
-        let mut data_obj: Option<IDataObject> = None;
-        OleGetClipboard(&mut data_obj)?;
-        let data_obj = data_obj.context("OleGetClipboard returned null")?;
+        let data_obj = OleGetClipboard()?;
 
         let mut fetc = FORMATETC {
             cfFormat: fmt_fc as u16,
@@ -561,7 +559,7 @@ mod win_clip {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
-        Ok(String::from_utf16_lossy(&words[..end]).into_owned())
+        Ok(String::from_utf16_lossy(&words[..end]))
     }
 
     pub unsafe fn write_clipboard_text(text: &str) -> Result<()> {
