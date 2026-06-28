@@ -332,7 +332,7 @@ mod win_clip {
                 Com::{
                     CoInitializeEx, CoUninitialize, IStream,
                     COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
-                    STGMEDIUM, TYMED_HGLOBAL, TYMED_ISTREAM,
+                    TYMED_HGLOBAL, TYMED_ISTREAM,
                 },
                 DataExchange::{
                     CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -482,11 +482,11 @@ mod win_clip {
             ptd:      std::ptr::null_mut(),
             dwAspect: DVASPECT_CONTENT.0 as u32,
             lindex:   index as i32,
-            tymed:    TYMED_ISTREAM.0,
+            tymed:    TYMED_ISTREAM.0 as u32,
         };
 
         if let Ok(mut stgm) = data_obj.GetData(&fetc) {
-            if stgm.tymed == TYMED_ISTREAM.0 {
+            if stgm.tymed == TYMED_ISTREAM.0 as u32 {
                 let data = {
                     let stream: &Option<IStream> = &*stgm.u.pstm;
                     if let Some(s) = stream { drain_istream(s)? } else { bail!("null IStream") }
@@ -497,7 +497,7 @@ mod win_clip {
             ReleaseStgMedium(&mut stgm);
         }
 
-        fetc.tymed = TYMED_HGLOBAL.0;
+        fetc.tymed = TYMED_HGLOBAL.0 as u32;
         let mut stgm = data_obj.GetData(&fetc)?;
         let hg   = stgm.u.hGlobal;
         let size = GlobalSize(hg);
