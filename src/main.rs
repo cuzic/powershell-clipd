@@ -876,9 +876,16 @@ mod win_clip {
         config_dir: std::path::PathBuf,
         reapproval: bool,
     ) {
+        let log_path = config_dir.join("toast.log");
         std::thread::spawn(move || {
-            if let Err(e) = show_register_toast_impl(name, entry, config_dir, reapproval) {
-                eprintln!("[clipwire] register toast error: {e}");
+            if let Err(e) = show_register_toast_impl(name.clone(), entry, config_dir.clone(), reapproval) {
+                let msg = format!("[clipwire] register toast error for '{}': {e}\n", name);
+                eprintln!("{}", msg.trim());
+                let _ = std::fs::write(&log_path, &msg);
+                // フォールバック: バルーン通知 + 手動 approve 案内
+                show_balloon(&format!(
+                    "'{}' の登録要求。承認: clipwire approve {}", name, name
+                ));
             }
         });
     }
@@ -939,10 +946,8 @@ mod win_clip {
             ))?;
         }
 
-        // 未パッケージアプリは既存 AUMID を借用する（cmd.exe）
-        let notifier = ToastNotificationManager::CreateToastNotifierWithId(
-            &HSTRING::from("{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\cmd.exe"),
-        )?;
+        // 未パッケージアプリは AUMID 不要のデフォルト notifier を使う
+        let notifier = ToastNotificationManager::CreateToastNotifier()?;
         notifier.Show(&toast)?;
 
         // ユーザー操作を最大 10 分待機
