@@ -14,7 +14,7 @@ triggers:
   - タスクをクリップボードに
 ---
 
-# /wclip
+# /clipwire-send
 
 Claude の出力内容を Windows クリップボードに送る。
 

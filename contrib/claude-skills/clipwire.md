@@ -13,13 +13,13 @@ triggers:
   - クリップボードの内容を取得
 ---
 
-# /clip
+# /clipwire
 
 Windows クリップボードの内容を取得して会話に展開する。
 
 ## 引数
 
-`$ARGUMENTS` — オプション。`-q`（quiet: パスのみ）/ `-d DIR`（画像保存先）/ `-w`（Wayland にも書き込む）
+`$ARGUMENTS` — オプション。`-q`（quiet: パスのみ）/ `-d DIR`（画像保存先）
 
 ## 実行手順
 
