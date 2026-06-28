@@ -53,6 +53,8 @@ enum Cmd {
     Get(GetArgs),
     /// stdin の内容を Windows クリップボードに書き込む
     Put(PutArgs),
+    /// Windows のデフォルトブラウザで Web サービスを開く
+    Open(OpenArgs),
 }
 
 #[derive(Args, Debug)]
@@ -87,6 +89,40 @@ struct GetArgs {
 
 #[derive(Args, Debug)]
 struct PutArgs;
+
+#[derive(Args, Debug)]
+struct OpenArgs {
+    /// 開くサービス
+    #[arg(value_enum)]
+    target: OpenTarget,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+enum OpenTarget {
+    /// ChatGPT (https://chatgpt.com)
+    Chatgpt,
+    /// Claude AI (https://claude.ai)
+    Claude,
+    /// Tailscale 管理画面 (https://login.tailscale.com/admin)
+    Tailscale,
+}
+
+impl OpenTarget {
+    fn url(&self) -> &'static str {
+        match self {
+            Self::Chatgpt   => "https://chatgpt.com",
+            Self::Claude    => "https://claude.ai",
+            Self::Tailscale => "https://login.tailscale.com/admin",
+        }
+    }
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chatgpt   => "chatgpt",
+            Self::Claude    => "claude",
+            Self::Tailscale => "tailscale",
+        }
+    }
+}
 
 // ── Client config ─────────────────────────────────────────────────────────────
 
@@ -245,6 +281,21 @@ fn cmd_put(cfg: &ClientConfig) -> Result<()> {
             bail!("HTTP {}: {}", code, r.into_string().unwrap_or_default().trim().to_string())
         }
         Err(e) => bail!("{} への送信に失敗: {}", cfg.base_url(), e),
+    }
+}
+
+// ── Client: open ──────────────────────────────────────────────────────────────
+
+fn cmd_open(cfg: &ClientConfig, args: &OpenArgs) -> Result<()> {
+    let url = format!("{}/open?name={}", cfg.base_url(), args.target.as_str());
+    let req = cfg.set_auth(ureq::get(&url).timeout(Duration::from_secs(10)));
+    match req.call() {
+        Ok(_) => { println!("Windows ブラウザで {} を開きました", args.target.url()); Ok(()) }
+        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(ureq::Error::Status(code, r)) => {
+            bail!("HTTP {}: {}", code, r.into_string().unwrap_or_default().trim().to_string())
+        }
+        Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
     }
 }
 
@@ -746,6 +797,22 @@ async fn handle_clip_post(State(s): State<AppState>, headers: HeaderMap, body: a
 
 #[derive(Deserialize)] struct FileQuery  { path: String }
 #[derive(Deserialize)] struct VFileQuery { i: usize }
+#[derive(Deserialize)] struct OpenQuery  { name: String }
+
+async fn handle_open(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<OpenQuery>) -> Response {
+    if !check_auth(&s.token, &headers) { return unauthorized(); }
+    let url = match q.name.as_str() {
+        "chatgpt"   => "https://chatgpt.com",
+        "claude"    => "https://claude.ai",
+        "tailscale" => "https://login.tailscale.com/admin",
+        other => return (StatusCode::BAD_REQUEST, format!("unknown target: {other}\n")).into_response(),
+    };
+    #[cfg(windows)]
+    if let Err(e) = std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("ブラウザを開けませんでした: {e}\n")).into_response();
+    }
+    (StatusCode::OK, format!("{url}\n")).into_response()
+}
 
 async fn handle_file(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<FileQuery>) -> Response {
     if !check_auth(&s.token, &headers) { return unauthorized(); }
@@ -850,6 +917,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         .route("/clip",   get(handle_clip).post(handle_clip_post))
         .route("/file",   get(handle_file))
         .route("/vfile",  get(handle_vfile))
+        .route("/open",   get(handle_open))
         .with_state(state.clone());
 
     let localhost = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -899,6 +967,10 @@ fn main() -> Result<()> {
         Cmd::Put(_) => {
             let cfg = ClientConfig::from_env()?;
             cmd_put(&cfg)
+        }
+        Cmd::Open(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_open(&cfg, &args)
         }
     }
 }
