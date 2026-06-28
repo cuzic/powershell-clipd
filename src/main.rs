@@ -55,8 +55,27 @@ enum Cmd {
     Put(PutArgs),
     /// Windows のデフォルトブラウザで Web サービスを開く
     Open(OpenArgs),
-    /// Linux の設定ファイルで定義したコマンドを Windows で実行して結果を取得
+    /// 登録済みターゲットを Windows で実行して結果を取得
     Exec(ExecArgs),
+    /// ターゲットの定義を Windows に送って承認待ちに追加
+    Register(RegisterArgs),
+    /// 承認待ちターゲットを承認して registered.toml に保存 (Windows ローカルで実行)
+    Approve(ApproveArgs),
+}
+
+#[derive(Args, Debug)]
+struct RegisterArgs {
+    /// 登録するターゲット名 (~/.config/clipwire/targets.toml で定義)
+    target: String,
+}
+
+#[derive(Args, Debug)]
+struct ApproveArgs {
+    /// 承認するターゲット名 (省略時は pending 一覧を表示)
+    target: Option<String>,
+    /// 実行ディレクトリ (Windows パス)
+    #[arg(long, short)]
+    dir: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -134,22 +153,87 @@ struct ExecArgs {
 
 // ── Exec target config ────────────────────────────────────────────────────────
 
+/// `steps` フィールドの値: 構造化配列 or 1行1コマンドの文字列
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[serde(untagged)]
+enum StepsDef {
+    Text(String),
+    Argv(Vec<Vec<String>>),
+}
+
+impl StepsDef {
+    fn into_argv(self) -> Vec<Vec<String>> {
+        match self {
+            StepsDef::Argv(v) => v,
+            StepsDef::Text(s) => s
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter_map(|l| shlex::split(l))
+                .collect(),
+        }
+    }
+}
+
+/// Linux 側 targets.toml のエントリ兼 HTTP 登録ペイロード (dir なし)
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[serde(untagged)]
+enum ExecPayload {
+    Script { script: String },
+    Steps  { steps: StepsDef, #[serde(default)] env: std::collections::HashMap<String, String> },
+}
+
+/// Windows 側 pending.toml / registered.toml のエントリ (dir あり)
+#[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
+struct StoredTarget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir:    Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps:  Option<StepsDef>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    env:    std::collections::HashMap<String, String>,
+}
+
+impl StoredTarget {
+    fn into_exec(self) -> Result<(Option<String>, ExecPayload)> {
+        if let Some(s) = self.script {
+            Ok((self.dir, ExecPayload::Script { script: s }))
+        } else if let Some(steps) = self.steps {
+            Ok((self.dir, ExecPayload::Steps { steps, env: self.env }))
+        } else {
+            bail!("ターゲットに script も steps もありません")
+        }
+    }
+}
+
+type TargetMap = std::collections::HashMap<String, StoredTarget>;
+
+fn clipwire_config_dir() -> PathBuf {
+    dirs_next::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("clipwire")
+}
+
+fn load_target_map(path: &Path) -> Result<TargetMap> {
+    if !path.exists() { return Ok(TargetMap::default()); }
+    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+fn save_target_map(path: &Path, map: &TargetMap) -> Result<()> {
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(path, toml::to_string(map)?)?;
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 struct TargetsFile {
-    targets: std::collections::HashMap<String, ExecTarget>,
+    targets: std::collections::HashMap<String, StoredTarget>,
 }
 
-#[derive(serde::Deserialize)]
-struct ExecTarget {
-    cmd: String,
-    dir: Option<String>,
-}
-
-fn load_exec_target(name: &str) -> Result<ExecTarget> {
-    let path = dirs_next::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-        .join("clipwire")
-        .join("targets.toml");
+fn load_exec_target(name: &str) -> Result<StoredTarget> {
+    let path = clipwire_config_dir().join("targets.toml");
     let src = std::fs::read_to_string(&path)
         .with_context(|| format!("設定ファイルが見つかりません: {}", path.display()))?;
     let file: TargetsFile = toml::from_str(&src)?;
@@ -322,20 +406,18 @@ fn cmd_put(cfg: &ClientConfig) -> Result<()> {
 // ── Client: exec ──────────────────────────────────────────────────────────────
 
 fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
-    let target = load_exec_target(&args.target)?;
-    let body = serde_json::json!({
-        "cmd": target.cmd,
-        "dir": target.dir,
-    });
-    let url = format!("{}/exec", cfg.base_url());
-    let req = cfg.set_auth(
+    let body = serde_json::json!({ "name": args.target }).to_string();
+    let url  = format!("{}/exec", cfg.base_url());
+    let req  = cfg.set_auth(
         ureq::post(&url)
             .set("Content-Type", "application/json")
             .timeout(Duration::from_secs(600)),
     );
-    let resp = match req.send_string(&body.to_string()) {
+    let resp = match req.send_string(&body) {
         Ok(r) => r,
         Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(ureq::Error::Status(404, _)) => bail!("'{}' は Windows 側に登録されていません。先に clipwire register を実行してください", args.target),
+        Err(ureq::Error::Status(409, r)) => bail!("{}", r.into_string().unwrap_or_default().trim()),
         Err(ureq::Error::Status(503, r)) => bail!("{}", r.into_string().unwrap_or_default().trim()),
         Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
     };
@@ -343,6 +425,66 @@ fn cmd_exec(cfg: &ClientConfig, args: &ExecArgs) -> Result<()> {
     let output = resp.into_string()?;
     print!("{output}");
     if exit_code != 0 { bail!("exit code {exit_code}"); }
+    Ok(())
+}
+
+// ── Client: register ──────────────────────────────────────────────────────────
+
+fn cmd_register(cfg: &ClientConfig, args: &RegisterArgs) -> Result<()> {
+    let target = load_exec_target(&args.target)?;
+    let mut body = serde_json::to_value(&target)?;
+    body.as_object_mut().unwrap().insert("name".into(), args.target.clone().into());
+    let url = format!("{}/register", cfg.base_url());
+    let req = cfg.set_auth(
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(30)),
+    );
+    match req.send_string(&body.to_string()) {
+        Ok(_) => { println!("'{}' を Windows の承認待ちに追加しました。Windows で clipwire approve {} を実行してください", args.target, args.target); Ok(()) }
+        Err(ureq::Error::Status(401, _)) => bail!("Unauthorized (CLIPD_TOKEN を確認)"),
+        Err(e) => bail!("{} に接続できません: {}", cfg.base_url(), e),
+    }
+}
+
+// ── Local: approve (Windows 側で実行) ────────────────────────────────────────
+
+fn cmd_approve(args: &ApproveArgs) -> Result<()> {
+    let config_dir   = clipwire_config_dir();
+    let pending_path = config_dir.join("pending.toml");
+    let mut pending  = load_target_map(&pending_path)?;
+
+    if args.target.is_none() {
+        if pending.is_empty() { println!("承認待ちのターゲットはありません"); }
+        else { for name in pending.keys() { println!("{name}"); } }
+        return Ok(());
+    }
+
+    let name = args.target.as_ref().unwrap();
+    let mut entry = pending.remove(name)
+        .with_context(|| format!("'{}' は pending にありません", name))?;
+
+    if let Some(ref d) = args.dir { entry.dir = Some(d.clone()); }
+
+    // 承認内容を表示
+    println!("=== {} ===", name);
+    if let Some(ref d) = entry.dir { println!("dir:    {}", d); }
+    if let Some(ref s) = entry.script {
+        println!("script:\n{}", s.trim());
+    } else if let Some(ref steps) = entry.steps {
+        let lines = match steps {
+            StepsDef::Text(s) => s.trim().to_string(),
+            StepsDef::Argv(v) => v.iter().map(|a| a.join(" ")).collect::<Vec<_>>().join("\n"),
+        };
+        println!("steps:\n{}", lines);
+    }
+
+    let registered_path = config_dir.join("registered.toml");
+    let mut registered  = load_target_map(&registered_path).unwrap_or_default();
+    registered.insert(name.clone(), entry);
+    save_target_map(&registered_path, &registered)?;
+    save_target_map(&pending_path, &pending)?;
+    println!("承認しました");
     Ok(())
 }
 
@@ -427,9 +569,10 @@ struct LastClip {
 
 #[derive(Clone)]
 struct AppState {
-    clip_tx:   mpsc::SyncSender<ClipRequest>,
-    token:     Option<String>,
-    last_clip: Arc<Mutex<LastClip>>,
+    clip_tx:    mpsc::SyncSender<ClipRequest>,
+    token:      Option<String>,
+    last_clip:  Arc<Mutex<LastClip>>,
+    config_dir: PathBuf,
 }
 
 // ── Windows clipboard implementation ──────────────────────────────────────────
@@ -861,41 +1004,196 @@ async fn handle_clip_post(State(s): State<AppState>, headers: HeaderMap, body: a
 #[derive(Deserialize)] struct VFileQuery { i: usize }
 #[derive(Deserialize)] struct OpenQuery  { name: String }
 
-async fn handle_exec(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+async fn handle_register(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     if !check_auth(&s.token, &headers) { return unauthorized(); }
 
     #[derive(serde::Deserialize)]
-    struct ExecReq { cmd: String, dir: Option<String> }
+    struct Req { name: String, #[serde(flatten)] target: StoredTarget }
 
-    let req: ExecReq = match serde_json::from_slice(&body) {
+    let req: Req = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response(),
     };
 
-    let (shell, flag) = if cfg!(windows) { ("cmd", "/c") } else { ("sh", "-c") };
-    let mut command = tokio::process::Command::new(shell);
-    command.args([flag, &req.cmd]);
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    if let Some(dir) = &req.dir {
-        command.current_dir(dir);
+    let entry = req.target;
+    let pending_path    = s.config_dir.join("pending.toml");
+    let registered_path = s.config_dir.join("registered.toml");
+
+    let mut pending    = load_target_map(&pending_path).unwrap_or_default();
+    let mut registered = load_target_map(&registered_path).unwrap_or_default();
+
+    // 既承認済みの場合は取り消して再承認を要求
+    let reapproval = registered.remove(&req.name).is_some();
+    pending.insert(req.name.clone(), entry);
+
+    if let Err(e) = save_target_map(&pending_path, &pending)
+        .and_then(|_| save_target_map(&registered_path, &registered))
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("保存エラー: {e}\n")).into_response();
     }
 
-    let output = match command.output().await {
-        Ok(o) => o,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("実行エラー: {e}\n")).into_response(),
+    let msg = if reapproval {
+        format!("'{}' の設定が変更されました。再承認が必要です: clipwire approve {}", req.name, req.name)
+    } else {
+        format!("'{}' の登録要求を受信。承認してください: clipwire approve {}", req.name, req.name)
+    };
+    #[cfg(windows)]
+    win_clip::show_balloon(&msg);
+
+    (StatusCode::OK, format!("{msg}\n")).into_response()
+}
+
+async fn handle_exec(State(s): State<AppState>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    if !check_auth(&s.token, &headers) { return unauthorized(); }
+
+    #[derive(serde::Deserialize)]
+    struct Req { name: String }
+
+    let req: Req = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("JSON parse error: {e}\n")).into_response(),
     };
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let mut combined = output.stderr;
-    combined.extend_from_slice(&output.stdout);
+    let registered = load_target_map(&s.config_dir.join("registered.toml")).unwrap_or_default();
+    let stored = match registered.get(&req.name) {
+        Some(t) => t.clone(),
+        None => {
+            let pending = load_target_map(&s.config_dir.join("pending.toml")).unwrap_or_default();
+            if pending.contains_key(&req.name) {
+                return (StatusCode::CONFLICT, format!("'{}' は承認待ちです。Windows で clipwire approve {} を実行してください\n", req.name, req.name)).into_response();
+            }
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
 
+    let (dir, payload) = match stored.into_exec() {
+        Ok(v)  => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+    };
+
+    match payload {
+        ExecPayload::Steps { steps, env } => {
+            let mut combined = Vec::new();
+            for args in &steps.into_argv() {
+                if args.is_empty() { continue; }
+                let mut cmd = tokio::process::Command::new(&args[0]);
+                cmd.args(&args[1..]);
+                cmd.envs(&env);
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                if let Some(ref d) = dir { cmd.current_dir(d); }
+                let output = match cmd.output().await {
+                    Ok(o) => o,
+                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("実行エラー: {e}\n")).into_response(),
+                };
+                combined.extend_from_slice(&output.stderr);
+                combined.extend_from_slice(&output.stdout);
+                if !output.status.success() {
+                    return exec_response(combined, output.status.code().unwrap_or(-1));
+                }
+            }
+            exec_response(combined, 0)
+        }
+
+        ExecPayload::Script { script } => {
+            match tokio::task::spawn_blocking(move || exec_rhai(&script, dir.as_deref())).await {
+                Ok(Ok((out, code))) => exec_response(out, code),
+                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+                Err(e)     => (StatusCode::INTERNAL_SERVER_ERROR, format!("thread panic: {e}\n")).into_response(),
+            }
+        }
+    }
+}
+
+fn exec_response(body: Vec<u8>, exit_code: i32) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header("X-Exit-Code", exit_code.to_string())
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(combined))
+        .body(Body::from(body))
         .unwrap()
+}
+
+fn exec_rhai(script: &str, dir: Option<&str>) -> Result<(Vec<u8>, i32)> {
+    use std::sync::{Arc, Mutex};
+    let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let dir = dir.map(str::to_string);
+
+    let mut engine = rhai::Engine::new();
+
+    // run(["cmd", "arg", ...]) — 失敗したらスクリプトを停止
+    {
+        let out = out.clone(); let dir = dir.clone();
+        engine.register_fn("run", move |args: rhai::Array| -> Result<(), Box<rhai::EvalAltResult>> {
+            let args: Vec<String> = args.iter()
+                .map(|a| a.clone().try_cast::<String>().unwrap_or_else(|| a.to_string()))
+                .collect();
+            if args.is_empty() { return Ok(()); }
+            let mut cmd = std::process::Command::new(&args[0]);
+            cmd.args(&args[1..]);
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            if let Some(ref d) = dir { cmd.current_dir(d); }
+            let o = cmd.output().map_err(|e| e.to_string())?;
+            { let mut g = out.lock().unwrap(); g.extend_from_slice(&o.stderr); g.extend_from_slice(&o.stdout); }
+            if !o.status.success() {
+                return Err(format!("exit code {}", o.status.code().unwrap_or(-1)).into());
+            }
+            Ok(())
+        });
+    }
+
+    // run_ok(["cmd", ...]) — 失敗しても続行、成功なら true
+    {
+        let out = out.clone(); let dir = dir.clone();
+        engine.register_fn("run_ok", move |args: rhai::Array| -> bool {
+            let args: Vec<String> = args.iter()
+                .map(|a| a.clone().try_cast::<String>().unwrap_or_else(|| a.to_string()))
+                .collect();
+            if args.is_empty() { return true; }
+            let mut cmd = std::process::Command::new(&args[0]);
+            cmd.args(&args[1..]);
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            if let Some(ref d) = dir { cmd.current_dir(d); }
+            match cmd.output() {
+                Ok(o) => {
+                    let mut g = out.lock().unwrap();
+                    g.extend_from_slice(&o.stderr); g.extend_from_slice(&o.stdout);
+                    o.status.success()
+                }
+                Err(_) => false,
+            }
+        });
+    }
+
+    // file_exists(path)
+    {
+        let dir = dir.clone();
+        engine.register_fn("file_exists", move |path: &str| -> bool {
+            let p = match &dir { Some(d) => std::path::Path::new(d).join(path), None => path.into() };
+            p.exists()
+        });
+    }
+
+    // rm(path) — ファイル削除、失敗しても続行
+    {
+        let dir = dir.clone();
+        engine.register_fn("rm", move |path: &str| -> bool {
+            let p = match &dir { Some(d) => std::path::Path::new(d).join(path), None => path.into() };
+            std::fs::remove_file(p).is_ok()
+        });
+    }
+
+    let code = match engine.eval::<()>(script) {
+        Ok(_)  => 0i32,
+        Err(e) => {
+            out.lock().unwrap().extend_from_slice(format!("script error: {e}\n").as_bytes());
+            1i32
+        }
+    };
+    let bytes = out.lock().unwrap().clone();
+    Ok((bytes, code))
 }
 
 async fn handle_open(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<OpenQuery>) -> Response {
@@ -1006,18 +1304,20 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
     let state = AppState {
         clip_tx,
-        token:     args.token.clone(),
-        last_clip: Arc::new(Mutex::new(LastClip::default())),
+        token:      args.token.clone(),
+        last_clip:  Arc::new(Mutex::new(LastClip::default())),
+        config_dir: clipwire_config_dir(),
     };
 
     let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/",       get(handle_clip))
-        .route("/clip",   get(handle_clip).post(handle_clip_post))
-        .route("/file",   get(handle_file))
-        .route("/vfile",  get(handle_vfile))
-        .route("/open",   get(handle_open))
-        .route("/exec",   post(handle_exec))
+        .route("/health",   get(handle_health))
+        .route("/",         get(handle_clip))
+        .route("/clip",     get(handle_clip).post(handle_clip_post))
+        .route("/file",     get(handle_file))
+        .route("/vfile",    get(handle_vfile))
+        .route("/open",     get(handle_open))
+        .route("/exec",     post(handle_exec))
+        .route("/register", post(handle_register))
         .with_state(state.clone());
 
     let localhost = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -1076,5 +1376,10 @@ fn main() -> Result<()> {
             let cfg = ClientConfig::from_env()?;
             cmd_exec(&cfg, &args)
         }
+        Cmd::Register(args) => {
+            let cfg = ClientConfig::from_env()?;
+            cmd_register(&cfg, &args)
+        }
+        Cmd::Approve(args) => cmd_approve(&args),
     }
 }
