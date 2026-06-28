@@ -989,10 +989,12 @@ mod win_clip {
 
     fn ensure_aumid_impl() -> windows::core::Result<()> {
         use windows::{
-            core::{GUID, PCWSTR},
+            core::{Interface, GUID, PCWSTR, PWSTR},
             Win32::{
-                Foundation::PWSTR,
-                System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER},
+                System::{
+                    Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER},
+                    Ole::{PROPVARIANT, VT_LPWSTR},
+                },
                 UI::Shell::{
                     IShellLinkW, ShellLink, SHGetKnownFolderPath,
                     FOLDERID_Programs, KF_FLAG_DEFAULT,
@@ -1000,7 +1002,6 @@ mod win_clip {
                 },
             },
         };
-        use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 
         unsafe {
             let programs = SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None)?;
@@ -1034,11 +1035,10 @@ mod win_clip {
 
             let prop_store: IPropertyStore = shell_link.cast()?;
 
-            // VT_LPWSTR = 31
             let aumid_wide: Vec<u16> =
                 CLIPWIRE_AUMID.encode_utf16().chain([0u16]).collect();
             let mut pv = PROPVARIANT::default();
-            pv.Anonymous.Anonymous.vt = 31; // VT_LPWSTR
+            pv.Anonymous.Anonymous.vt = VT_LPWSTR.0 as u16;
             pv.Anonymous.Anonymous.Anonymous.pwszVal =
                 PWSTR(aumid_wide.as_ptr() as *mut u16);
 
